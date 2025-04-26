@@ -6,182 +6,219 @@
 #include "HX711.h"
 #include <RTClib.h>
 #include <NewPing.h>
-#include "esp_sleep.h"
 
-// ————— CONFIG —————
-#define DEBUG            0       // 1 = Serial debug on
-#define FILL_THRESHOLD   0.90f   // publish immediately if fill% ≥ this
+// Sensor Pin Definitions
+#define MQ135_PIN 34
+#define MQ4_PIN 35
+#define HX711_DOUT 12
+#define HX711_SCK 14
+#define TRIG_PIN 27
+#define ECHO_PIN 26
 
-// Sensor pins
-#define MQ135_PIN   34
-#define MQ4_PIN     35
-#define HX711_DOUT  12
-#define HX711_SCK   14
-#define TRIG_PIN    27
-#define ECHO_PIN    26
+// Define Mode
+#define MODE 2 // 1 for data real sensor, 2 for simulation data
 
-// Calibration
-#define SCALE_FACTOR 1.0f
-#define MAX_DEPTH_CM 100.0f
-#define MIN_DEPTH_CM 10.0f
+// HX711 Calibration
+#define SCALE_FACTOR 1.0
 
-// Location & MQTT topic
-const char* locId    = "TPS_001";
-const char* topicPub = "foodwaste/TPS_001";
+// RTC Initialization
+RTC_DS3231 rtc;
 
-// Globals
-RTC_DS3231   rtc;
-HX711        scale;
-WiFiClientSecure net;
-PubSubClient     client(net);
+// HX711 Initialization
+HX711 scale;
 
-// Persist across deep-sleep cycles
-RTC_DATA_ATTR float lastPublishedFill = 0.0f;
+// HC-SR04 Initialization
+long duration;
+float distance;
 
-// Debug macros
-#if DEBUG
-  #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
-  #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
-#else
-  #define DBG_PRINT(...)
-  #define DBG_PRINTLN(...)
-#endif
+// Data Variables
+float weight;
+float fill_percentage;
+float NH3;
+float CH4;
+String dayOfWeek;
+bool isWeekend;
+bool isPickingDay;
+String timestamp;
+String locId = "TPS_001";
+float latitude = 25.02654098984479;
+float longitude = 121.5447185774265;
 
-const char* daysOfWeek[] = {
-  "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"
-};
+String topic = "foodwaste/" + locId;
+ 
+WiFiClientSecure net = WiFiClientSecure();
+PubSubClient client(net);
 
-// Compute fill percentage
-float calcFill(float dist) {
-  if (dist >= MAX_DEPTH_CM) return 0.0f;
-  if (dist <= MIN_DEPTH_CM) return 1.0f;
-  return 1.0f - ((dist - MIN_DEPTH_CM) / (MAX_DEPTH_CM - MIN_DEPTH_CM));
+void messageHandler(char* topic, byte* payload, unsigned int length)
+{
+  Serial.print("incoming: ");
+  Serial.println(topic);
+ 
+  StaticJsonDocument<200> doc;
+  deserializeJson(doc, payload);
+  const char* message = doc["message"];
+  Serial.println(message);
 }
-
-// Connect to AWS IoT, publish JSON, then disconnect
-void publishReading(float weight, float fill, float nh3, float ch4,
-                    const String& ts, const char* dow, bool isWeekend, bool pickDay) {
-  // Wi-Fi
+ 
+void connectAWS()
+{
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(200);
-    DBG_PRINT(".");
+ 
+  Serial.println("Connecting to Wi-Fi");
+ 
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
   }
-  DBG_PRINTLN("WiFi connected");
-
-  // TLS credentials
+ 
+  // Configure WiFiClientSecure to use the AWS IoT device credentials
   net.setCACert(AWS_CERT_CA);
   net.setCertificate(AWS_CERT_CRT);
   net.setPrivateKey(AWS_CERT_PRIVATE);
-
-  // MQTT
+ 
+  // Connect to the MQTT broker on the AWS endpoint we defined earlier
   client.setServer(AWS_IOT_ENDPOINT, 8883);
-  if (!client.connect(THINGNAME)) {
-    DBG_PRINTLN("MQTT connect failed");
-    WiFi.disconnect(true);
+ 
+  // Create a message handler
+  client.setCallback(messageHandler);
+ 
+  Serial.println("Connecting to AWS IOT");
+ 
+  while (!client.connect(THINGNAME))
+  {
+    Serial.print(".");
+    delay(100);
+  }
+ 
+  if (!client.connected())
+  {
+    Serial.println("AWS IoT Timeout!");
     return;
   }
-  DBG_PRINTLN("MQTT connected");
-
-  // Build JSON payload
-  StaticJsonDocument<256> doc;
-  doc["Timestamp"]       = ts;
-  doc["Weight_kg"]       = weight;
-  doc["Fill_pct"]        = fill;
-  doc["Gas_CH4_ppm"]     = ch4;
-  doc["Gas_NH3_ppm"]     = nh3;
-  doc["DayOfWeek"]       = dow;
-  doc["IsWeekend"]       = isWeekend;
-  doc["IsPickupDay"]     = pickDay;
-  doc["LocationID"]      = locId;
-  doc["Latitude"]        = 25.02654098984479;
-  doc["Longitude"]       = 121.5447185774265;
-  char buf[512];
-  size_t n = serializeJson(doc, buf);
-
-  client.publish(topicPub, buf, n);
-  DBG_PRINTLN("Published");
-
-  client.disconnect();
-  WiFi.disconnect(true);
+ 
+  // Subscribe to a topic
+  client.subscribe(topic.c_str());
+ 
+  Serial.println("AWS IoT Connected!");
 }
 
-void setup() {
-  #if DEBUG
-    Serial.begin(115200);
-    delay(100);
-  #endif
-  DBG_PRINTLN("Wake");
+float calculateFillPercentage(float distance) {
+  // Calibrate 
+  float maxDistance = 100.0; // Max trashbin depth
+  float minDistance = 10.0; // Min trashbin depth
+  float fillPercentage = 0.0;
 
-  // Init RTC
-  if (!rtc.begin()) {
-    DBG_PRINTLN("RTC init failed");
-    while (true);
+  if (distance >= maxDistance) {
+    fillPercentage = 0.0;
+  } else if (distance <= minDistance) {
+    fillPercentage = 1.0;
+  } else {
+    fillPercentage = 1.0 - ((distance - minDistance) / (maxDistance - minDistance));
   }
 
-  // Init HX711
-  scale.begin(HX711_DOUT, HX711_SCK);
-  scale.set_scale(SCALE_FACTOR);
-  scale.tare();
+  return fillPercentage;
+}
 
-  // HC-SR04 pins
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+String getDayOfWeek(int dayIndex) {
+  String days[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  return days[dayIndex];
+}
 
-  // Read weight
-  float weight = scale.get_units(5);
-  scale.power_down();
+void readSensors() {
+  // Read HX711 Weight Sensor
+  weight = scale.get_units();
 
-  // Read distance
+  // Read HC-SR04 Distance Sensor
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  long dur = pulseIn(ECHO_PIN, HIGH, 30000);
-  float dist = dur > 0 ? (dur * 0.0343f) / 2.0f : MAX_DEPTH_CM;
-  float fill = calcFill(dist);
+  duration = pulseIn(ECHO_PIN, HIGH);
+  distance = (duration * 0.0343) / 2; // Calculate distance in cm
+  fill_percentage = calculateFillPercentage(distance);
 
-  // Read gas sensors
-  float nh3 = analogRead(MQ135_PIN);
-  float ch4 = analogRead(MQ4_PIN);
+  // Read MQ-135 and MQ-4 Gas Sensors
+  NH3 = analogRead(MQ135_PIN);
+  CH4 = analogRead(MQ4_PIN);
 
-  // Timestamp
+  // Read RTC Time
   DateTime now = rtc.now();
-  String ts = String(now.year()) + "-" + String(now.month()) + "-" + String(now.day()) +
-              " " + String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
-  int dow = now.dayOfTheWeek();
-  bool isWeekend = (dow == 0 || dow == 6);
-  bool pickDay   = (fill >= FILL_THRESHOLD);
-
-  DBG_PRINT("Fill="); DBG_PRINT(fill);
-  DBG_PRINT(" LastPub="); DBG_PRINTLN(lastPublishedFill);
-
-  // Publish if first run, significant change, or pickup threshold
-  if (lastPublishedFill == 0.0f ||
-      fabs(fill - lastPublishedFill) >= 0.05f ||
-      pickDay) {
-    publishReading(weight, fill, nh3, ch4, ts, daysOfWeek[dow], isWeekend, pickDay);
-    lastPublishedFill = fill;
-  } else {
-    DBG_PRINTLN("Skip publish");
-  }
-
-  // —— ALIGN TO TOP OF NEXT HOUR ——
-  // Compute seconds until next HH:00:00
-  uint32_t secToNext =
-      (60 - now.minute() - 1) * 60  // minutes left
-    + (60 - now.second());          // seconds left
-  DBG_PRINT("Sleeping for ");
-  DBG_PRINT(secToNext / 60);
-  DBG_PRINT("m ");
-  DBG_PRINTLN(secToNext % 60);
-
-  esp_sleep_enable_timer_wakeup(uint64_t(secToNext) * 1000000ULL);
-  delay(100);
-  esp_deep_sleep_start();
+  timestamp = String(now.year(), 10) + "-" + String(now.month(), 10) + "-" + String(now.day(), 10) + " " + String(now.hour(), 10) + ":" + String(now.minute(), 10) + ":" + String(now.second(), 10);
+  dayOfWeek = getDayOfWeek(now.dayOfTheWeek());
+  isWeekend = (now.dayOfTheWeek() == 0 || now.dayOfTheWeek() == 6);
+  isPickingDay = (fill_percentage >= 0.9);
 }
 
-void loop() {
+void readSensorsSim() {
+  // Simulated HX711 Weight Sensor
+  weight = random(0, 15000) / 1000.0; // Random weight between 0 and 15 kg
+
+  // Simulated HC-SR04 Distance Sensor
+  distance = random(10, 100); // Random distance between 10 and 100 cm
+  fill_percentage = calculateFillPercentage(distance);
+
+  // Simulated MQ-135 and MQ-4 Gas Sensors
+  NH3 = random(0, 1000) / 10.0; // Random NH3 value
+  CH4 = random(0, 1000) / 10.0; // Random CH4 value
+
+  // Simulated RTC Time
+  DateTime now(2024, 3, 11, random(0, 23), random(0, 59), random(0, 59)); // Simulated date and time
+  timestamp = String(now.year(), 10) + "-" + String(now.month(), 10) + "-" + String(now.day(), 10) + " " + String(now.hour(), 10) + ":" + String(now.minute(), 10) + ":" + String(now.second(), 10);
+  dayOfWeek = getDayOfWeek(now.dayOfTheWeek());
+  isWeekend = (now.dayOfTheWeek() == 0 || now.dayOfTheWeek() == 6);
+  isPickingDay = (fill_percentage >= 0.9); // Simulated picking day
+}
+ 
+void publishMessage() {
+  StaticJsonDocument<200> doc;
+  doc["Timestamp"] = timestamp;
+  doc["Berat (kg)"] = weight;
+  doc["Fill_Percentage (%)"] = fill_percentage;
+  doc["Kualitas_Gas_CH4 (ppm)"] = CH4;
+  doc["Kualitas_Gas_NH3 (ppm)"] = NH3;
+  doc["Hari_dalam_Minggu"] = dayOfWeek;
+  doc["Akhir_Pekan"] = isWeekend;
+  doc["Hari_Pengambilan"] = isPickingDay;
+  doc["Lokasi_ID"] = locId;
+  doc["Latitude"] = latitude;
+  doc["Longitude"] = longitude;
+
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer);
+
+  client.publish(topic.c_str(), jsonBuffer);
+}
+ 
+void setup()
+{
+  Serial.begin(115200);
+  
+  scale.begin(HX711_DOUT, HX711_SCK);
+  scale.set_scale(SCALE_FACTOR);
+  scale.tare();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  if (!rtc.begin()) {
+    Serial.println("RTC tidak ditemukan!");
+    while (1);
+  }
+
+  connectAWS();
+}
+
+void loop()
+{
+  if (MODE > 1) {
+    readSensorsSim();
+  } else {
+    readSensors();
+  }
+  publishMessage();
+  client.loop();
+  delay(1000);
 }
